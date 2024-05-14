@@ -11,6 +11,7 @@
 /btrfsdist
 /btrfsslower
 /cachestat
+/capable
 /cpudist
 /cpufreq
 /drsnoop
@@ -30,6 +31,7 @@
 /klockstat
 /ksnoop
 /llcstat
+/memleak
 /mdflush
 /mountsnoop
 /nfsdist

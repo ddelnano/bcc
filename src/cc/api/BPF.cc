@@ -858,31 +858,14 @@ bool BPF::add_module(std::string module)
 
 namespace {
 
-std::string random_alnum_string(int len) {
-  static constexpr char kDict[] = "0123456789abcdefghijklmnopqrstuvwxyz";
-  static std::random_device rd;
-  std::uniform_int_distribution<size_t> dist(0, sizeof(kDict)-1);
-  std::string res;
-  res.reserve(len);
-  for (int i = 0; i < len; ++i) {
-    res.push_back(kDict[dist(rd)]);
-  }
-  return res;
-}
-
 constexpr size_t kEventNameSizeLimit = 224;
 
 std::string shorten_event_name(const std::string& name) {
-  constexpr size_t kRandomSuffixLen = 16;
-  std::string res;
-  res.reserve(kEventNameSizeLimit);
-  res.assign(name);
-  res.resize(kEventNameSizeLimit - kRandomSuffixLen);
-  res.append(random_alnum_string(kRandomSuffixLen));
-  return res;
+  std::string hash = uint_to_hex(std::hash<std::string>{}(name));
+  return name.substr(0, kEventNameSizeLimit - hash.size()) + hash;
 }
 
-}  // namespace
+} // namespace
 
 std::string BPF::get_uprobe_event(const std::string& binary_path,
                                   uint64_t offset, bpf_probe_attach_type type,
@@ -893,13 +876,7 @@ std::string BPF::get_uprobe_event(const std::string& binary_path,
   if (pid != -1)
     res += "_" + std::to_string(pid);
   if (res.size() > kEventNameSizeLimit) {
-    auto iter = name_map_.find(res);
-    if (iter != name_map_.end()) {
-      return iter->second;
-    }
-    std::string shortend_name = shorten_event_name(res);
-    name_map_[res] = shortend_name;
-    return shortend_name;
+    return shorten_event_name(res);
   }
   return res;
 }
