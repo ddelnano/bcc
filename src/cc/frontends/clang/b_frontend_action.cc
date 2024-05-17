@@ -520,6 +520,27 @@ bool ProbeVisitor::VisitBinaryOperator(BinaryOperator *E) {
   }
   return true;
 }
+
+static std::string FixBTFTypeTag(std::string TypeStr)
+{
+#if LLVM_VERSION_MAJOR == 15
+  std::map<std::string, std::string> TypePair =
+    {{"btf_type_tag(user)", "__attribute__((btf_type_tag(\"user\")))"},
+     {"btf_type_tag(rcu)", "__attribute__((btf_type_tag(\"rcu\")))"},
+     {"btf_type_tag(percpu)", "__attribute__((btf_type_tag(\"percpu\")))"}};
+
+  for (auto T: TypePair) {
+    size_t index;
+    index = TypeStr.find(T.first, 0);
+    if (index != std::string::npos) {
+      TypeStr.replace(index, T.first.size(), T.second);
+      return TypeStr;
+    }
+  }
+#endif
+  return TypeStr;
+}
+
 bool ProbeVisitor::VisitUnaryOperator(UnaryOperator *E) {
   if (E->getOpcode() == UO_AddrOf) {
     addrof_stmt_ = E;
@@ -598,7 +619,7 @@ bool ProbeVisitor::VisitMemberExpr(MemberExpr *E) {
   string rhs = rewriter_.getRewrittenText(expansionRange(SourceRange(rhs_start, GET_ENDLOC(E))));
   string base_type = base->getType()->getPointeeType().getAsString();
   string pre, post;
-  pre = "({ typeof(" + E->getType().getAsString() + ") _val; __builtin_memset(&_val, 0, sizeof(_val));";
+  pre = "({ typeof(" + FixBTFTypeTag(E->getType().getAsString()) + ") _val; __builtin_memset(&_val, 0, sizeof(_val));";
   if (cannot_fall_back_safely)
     pre += " bpf_probe_read_kernel(&_val, sizeof(_val), (void *)&";
   else
@@ -652,7 +673,7 @@ bool ProbeVisitor::VisitArraySubscriptExpr(ArraySubscriptExpr *E) {
   if (rewriter_.getRewrittenText(lbracket_range).size() == 0)
     return true;
 
-  pre = "({ typeof(" + E->getType().getAsString() + ") _val; __builtin_memset(&_val, 0, sizeof(_val));";
+  pre = "({ typeof(" + FixBTFTypeTag(E->getType().getAsString()) + ") _val; __builtin_memset(&_val, 0, sizeof(_val));";
   if (cannot_fall_back_safely)
     pre += " bpf_probe_read_kernel(&_val, sizeof(_val), (void *)((";
   else
@@ -729,7 +750,7 @@ bool ProbeVisitor::IsContextMemberExpr(Expr *E) {
 
 SourceRange
 ProbeVisitor::expansionRange(SourceRange range) {
-#if LLVM_MAJOR_VERSION >= 7
+#if LLVM_VERSION_MAJOR >= 7
   return rewriter_.getSourceMgr().getExpansionRange(range).getAsRange();
 #else
   return rewriter_.getSourceMgr().getExpansionRange(range);
@@ -755,18 +776,18 @@ BTypeVisitor::BTypeVisitor(ASTContext &C, BFrontendAction &fe)
 
 void BTypeVisitor::genParamDirectAssign(FunctionDecl *D, string& preamble,
                                         const char **calling_conv_regs) {
-  for (size_t idx = 0; idx < fn_args_.size(); idx++) {
+  for (size_t idx = 1; idx < fn_args_.size(); idx++) {
     ParmVarDecl *arg = fn_args_[idx];
 
-    if (idx >= 1) {
+    if (arg->isUsed()) {
       // Move the args into a preamble section where the same params are
       // declared and initialized from pt_regs.
-      // Todo: this init should be done only when the program requests it.
+      // This init is only performed when requested by the program.
       string text = rewriter_.getRewrittenText(expansionRange(arg->getSourceRange()));
       arg->addAttr(UnavailableAttr::CreateImplicit(C, "ptregs"));
       size_t d = idx - 1;
       const char *reg = calling_conv_regs[d];
-      preamble += " " + text + " = (" + arg->getType().getAsString() + ")" +
+      preamble += " " + text + " = (" + FixBTFTypeTag(arg->getType().getAsString()) + ")" +
                   fn_args_[0]->getName().str() + "->" + string(reg) + ";";
     }
   }
@@ -774,33 +795,41 @@ void BTypeVisitor::genParamDirectAssign(FunctionDecl *D, string& preamble,
 
 void BTypeVisitor::genParamIndirectAssign(FunctionDecl *D, string& preamble,
                                           const char **calling_conv_regs) {
-  string new_ctx;
+  string tmp_preamble;
+  bool hasUsed = false;
+  ParmVarDecl *arg = fn_args_[0];
+  string new_ctx = "__" + arg->getName().str();
 
-  for (size_t idx = 0; idx < fn_args_.size(); idx++) {
-    ParmVarDecl *arg = fn_args_[idx];
+  for (size_t idx = 1; idx < fn_args_.size(); idx++) {
+    arg = fn_args_[idx];
 
-    if (idx == 0) {
-      new_ctx = "__" + arg->getName().str();
-      preamble += " struct pt_regs * " + new_ctx + " = (void *)" +
-                  arg->getName().str() + "->" +
-                  string(pt_regs_syscall_regs()) + ";";
-    } else {
+    if (arg->isUsed()) {
       // Move the args into a preamble section where the same params are
       // declared and initialized from pt_regs.
-      // Todo: this init should be done only when the program requests it.
+      // This init is only performed when requested by the program.
+      hasUsed = true;
       string text = rewriter_.getRewrittenText(expansionRange(arg->getSourceRange()));
       size_t d = idx - 1;
       const char *reg = calling_conv_regs[d];
-      preamble += "\n " + text + ";";
+      tmp_preamble += "\n " + text + ";";
       if (cannot_fall_back_safely)
-        preamble += " bpf_probe_read_kernel";
+        tmp_preamble += " bpf_probe_read_kernel";
       else
-        preamble += " bpf_probe_read";
-      preamble += "(&" + arg->getName().str() + ", sizeof(" +
+        tmp_preamble += " bpf_probe_read";
+      tmp_preamble += "(&" + arg->getName().str() + ", sizeof(" +
                   arg->getName().str() + "), &" + new_ctx + "->" +
                   string(reg) + ");";
     }
   }
+
+  arg = fn_args_[0];
+  if ( hasUsed || arg->isUsed()) {
+    preamble += " struct pt_regs * " + new_ctx + " = (void *)" +
+                arg->getName().str() + "->" +
+                string(pt_regs_syscall_regs()) + ";";
+  }
+
+  preamble += tmp_preamble;
 }
 
 void BTypeVisitor::rewriteFuncParam(FunctionDecl *D) {
@@ -1059,6 +1088,11 @@ bool BTypeVisitor::VisitCallExpr(CallExpr *Call) {
           string args = rewriter_.getRewrittenText(expansionRange(SourceRange(GET_BEGINLOC(Call->getArg(0)),
                                                            GET_ENDLOC(Call->getArg(1)))));
           txt = "bpf_ringbuf_discard(" + args + ")";
+        } else if (memb_name == "ringbuf_query") {
+          string name = string(Ref->getDecl()->getName());
+          string arg0 = rewriter_.getRewrittenText(expansionRange(Call->getArg(0)->getSourceRange()));
+          txt = "bpf_ringbuf_query((void *)bpf_pseudo_fd(1, " + fd + ")";
+          txt += ", " + arg0 + ")";
         } else if (memb_name == "ringbuf_submit") {
           string name = string(Ref->getDecl()->getName());
           string args = rewriter_.getRewrittenText(expansionRange(SourceRange(GET_BEGINLOC(Call->getArg(0)),
@@ -1281,9 +1315,12 @@ bool BTypeVisitor::checkFormatSpecifiers(const string& fmt, SourceLocation loc) 
       i++;
     } else if (fmt[i] == 'p' || fmt[i] == 's') {
       i++;
+      if (fmt[i-1] == 'p' && fmt[i] == 'S') {
+        i++;
+      }
       if (!isspace(fmt[i]) && !ispunct(fmt[i]) && fmt[i] != 0) {
         warning(loc.getLocWithOffset(i - 2),
-                "only %%d %%u %%x %%ld %%lu %%lx %%lld %%llu %%llx %%p %%s conversion specifiers allowed");
+                "only %%d %%u %%x %%ld %%lu %%lx %%lld %%llu %%llx %%p %%pS %%s conversion specifiers allowed");
         return false;
       }
       if (fmt[i - 1] == 's') {
@@ -1374,7 +1411,7 @@ bool BTypeVisitor::VisitImplicitCastExpr(ImplicitCastExpr *E) {
 
 SourceRange
 BTypeVisitor::expansionRange(SourceRange range) {
-#if LLVM_MAJOR_VERSION >= 7
+#if LLVM_VERSION_MAJOR >= 7
   return rewriter_.getSourceMgr().getExpansionRange(range).getAsRange();
 #else
   return rewriter_.getSourceMgr().getExpansionRange(range);
@@ -1397,7 +1434,7 @@ int64_t BTypeVisitor::getFieldValue(VarDecl *Decl, FieldDecl *FDecl, int64_t Ori
   unsigned idx = FDecl->getFieldIndex();
 
   if (auto I = dyn_cast_or_null<InitListExpr>(Decl->getInit())) {
-#if LLVM_MAJOR_VERSION >= 8
+#if LLVM_VERSION_MAJOR >= 8
     Expr::EvalResult res;
     if (I->getInit(idx)->EvaluateAsInt(res, C)) {
       return res.Val.getInt().getExtValue();
@@ -1796,7 +1833,7 @@ void BFrontendAction::DoMiscWorkAround() {
     false);
 
   rewriter_->getEditBuffer(rewriter_->getSourceMgr().getMainFileID()).InsertTextAfter(
-#if LLVM_MAJOR_VERSION >= 12
+#if LLVM_VERSION_MAJOR >= 12
     rewriter_->getSourceMgr().getBufferOrFake(rewriter_->getSourceMgr().getMainFileID()).getBufferSize(),
 #else
     rewriter_->getSourceMgr().getBuffer(rewriter_->getSourceMgr().getMainFileID())->getBufferSize(),
@@ -1810,7 +1847,7 @@ void BFrontendAction::EndSourceFileAction() {
 
   if (flags_ & DEBUG_PREPROCESSOR)
     rewriter_->getEditBuffer(rewriter_->getSourceMgr().getMainFileID()).write(llvm::errs());
-#if LLVM_MAJOR_VERSION >= 9
+#if LLVM_VERSION_MAJOR >= 9
   llvm::raw_string_ostream tmp_os(mod_src_);
   rewriter_->getEditBuffer(rewriter_->getSourceMgr().getMainFileID())
       .write(tmp_os);
