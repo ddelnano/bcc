@@ -186,7 +186,7 @@ int bpf_update_batch(int fd, void *keys, void *values, __u32 *count);
 int bpf_lookup_and_delete_batch(int fd, __u32 *in_batch, __u32 *out_batch,
                                 void *keys, void *values, __u32 *count);
 
-#define LOG_BUF_SIZE 65536
+#define LOG_BUF_SIZE 1048576
 
 // Put non-static/inline functions in their own section with this prefix +
 // fn_name to enable discovery by the bcc library.
